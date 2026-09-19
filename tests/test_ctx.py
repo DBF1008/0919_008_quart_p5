@@ -22,9 +22,39 @@ from quart.globals import g
 from quart.globals import request
 from quart.globals import websocket
 from quart.routing import QuartRule
+from quart.sessions import SecureCookieSession
+from quart.sessions import SecureCookieSessionInterface
 from quart.testing import make_test_headers_path_and_query_string
 from quart.testing import no_op_push
 from quart.wrappers import Request
+
+
+async def test_contexts_do_not_share_session(http_scope: HTTPScope) -> None:
+    app = Quart(__name__)
+    shared_session = SecureCookieSession()
+
+    class SharedSessionInterface(SecureCookieSessionInterface):
+        async def open_session(self, app, request):  # type: ignore
+            return shared_session
+
+    app.session_interface = SharedSessionInterface()
+
+    ctx1 = app.test_request_context("/")
+    ctx2 = app.test_request_context("/")
+    await ctx1.push()
+    await ctx2.push()
+    try:
+        # Each context must have an independent session object so
+        # that concurrent mutation cannot race on a shared reference.
+        assert ctx1.session is not shared_session
+        assert ctx2.session is not shared_session
+        assert ctx1.session is not ctx2.session
+        ctx1.session["key"] = "value"
+        assert "key" not in ctx2.session
+        assert "key" not in shared_session
+    finally:
+        await ctx2.pop(None)
+        await ctx1.pop(None)
 
 
 async def test_request_context_match(http_scope: HTTPScope) -> None:

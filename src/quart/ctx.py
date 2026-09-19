@@ -112,12 +112,19 @@ class _BaseRequestWebsocketContext:
     async def _push(self) -> None:
         if self.session is None:
             session_interface = self.app.session_interface
-            self.session = await self.app.ensure_async(session_interface.open_session)(
+            session = await self.app.ensure_async(session_interface.open_session)(
                 self.app, self.request_websocket
             )
 
-            if self.session is None:
-                self.session = await session_interface.make_null_session(self.app)
+            if session is None:
+                session = await session_interface.make_null_session(self.app)
+            elif not session_interface.is_null_session(session):
+                # Ensure this context has its own session object, as
+                # open_session may return an object shared with other
+                # contexts, which would race on concurrent mutation.
+                session = session_interface.copy_session(session)
+
+            self.session = session
 
         if self.url_adapter is not None:
             self.match_request()

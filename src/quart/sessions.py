@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import hashlib
 from datetime import datetime
 from datetime import timezone
+from typing import Any
+from typing import Hashable
 from typing import TYPE_CHECKING
 
 from flask.sessions import NullSession as NullSession  # noqa: F401
@@ -34,6 +38,32 @@ class SessionInterface:
     null_session_class = NullSession
     pickle_based = False
 
+    def __init__(self) -> None:
+        # Tracks per-session locks, versions, and snapshots so that
+        # concurrent requests sharing a session can be serialized and
+        # merged rather than silently losing each other's changes.
+        self._locks: dict[Hashable, asyncio.Lock] = {}
+        self._versions: dict[Hashable, int] = {}
+        self._snapshots: dict[Hashable, dict[str, Any]] = {}
+
+    def _get_lock(self, key: Hashable) -> asyncio.Lock:
+        """Return the lock guarding the session identified by key."""
+        try:
+            return self._locks[key]
+        except KeyError:
+            lock = self._locks[key] = asyncio.Lock()
+            return lock
+
+    def copy_session(self, session: SessionMixin) -> SessionMixin:
+        """Return an independent copy of the given session.
+
+        Session interfaces may return the same object from
+        ``open_session`` for concurrent requests; copying ensures each
+        request context mutates its own session object and therefore
+        cannot race with other contexts.
+        """
+        return copy.copy(session)
+
     async def make_null_session(self, app: Quart) -> NullSession:
         """Create a Null session object.
 
@@ -51,7 +81,12 @@ class SessionInterface:
         return app.config["SESSION_COOKIE_NAME"]
 
     def get_cookie_domain(self, app: Quart) -> str | None:
-        """Helper method to return the Cookie Domain for the App."""
+        """Helper method to return the Cookie Domain for the App.
+
+        An empty string is normalized to None so that the Domain
+        attribute is omitted from the cookie, matching the unset
+        (None) configuration semantics.
+        """
         rv = app.config["SESSION_COOKIE_DOMAIN"]
         return rv if rv else None
 
@@ -60,8 +95,15 @@ class SessionInterface:
         return app.config["SESSION_COOKIE_PARTITIONED"]
 
     def get_cookie_path(self, app: Quart) -> str:
-        """Helper method to return the Cookie path for the App."""
-        return app.config["SESSION_COOKIE_PATH"] or app.config["APPLICATION_ROOT"]
+        """Helper method to return the Cookie path for the App.
+
+        Falls back to "/" when neither SESSION_COOKIE_PATH nor
+        APPLICATION_ROOT provide a non-empty value, ensuring the
+        cookie Path is never the empty string.
+        """
+        return (
+            app.config["SESSION_COOKIE_PATH"] or app.config["APPLICATION_ROOT"] or "/"
+        )
 
     def get_cookie_httponly(self, app: Quart) -> bool:
         """Helper method to return if the Cookie should be HTTPOnly for the App."""
@@ -184,9 +226,17 @@ class SecureCookieSessionInterface(SessionInterface):
         max_age = int(app.permanent_session_lifetime.total_seconds())
         try:
             data = signer.loads(cookie, max_age=max_age)
-            return self.session_class(data)
+            session = self.session_class(data)
         except BadSignature:
             return self.session_class()
+
+        # Track the session so that concurrent requests sharing this
+        # cookie can be serialized and merged when saved.
+        key = hashlib.sha256(cookie.encode()).hexdigest()
+        session._session_key = key
+        session._session_version = self._versions.get(key, 0)
+        session._session_base = dict(session)
+        return session
 
     async def save_session(
         self,
@@ -195,6 +245,47 @@ class SecureCookieSessionInterface(SessionInterface):
         response: Response | WerkzeugResponse | None,
     ) -> None:
         """Saves the session to the response in a secure cookie."""
+        key = getattr(session, "_session_key", None)
+        if response is None or key is None:
+            await self._save_session(app, session, response)
+            return
+
+        # Serialize concurrent saves of the same session and merge
+        # any changes saved by other requests since this session was
+        # opened, preventing lost updates.
+        async with self._get_lock(key):
+            version = getattr(session, "_session_version", 0)
+            if session.modified and self._versions.get(key, 0) != version:
+                self._merge_session(session, key)
+            await self._save_session(app, session, response)
+            self._versions[key] = version + 1
+            self._snapshots[key] = dict(session)
+
+    def _merge_session(self, session: SessionMixin, key: Hashable) -> None:
+        """Merge changes saved by other requests into the session.
+
+        Applies this session's changes (relative to the data it was
+        opened with) on top of the latest saved snapshot, so that
+        concurrent modifications to distinct keys are not lost.
+        """
+        base: dict[str, Any] = getattr(session, "_session_base", {})
+        merged = dict(self._snapshots.get(key, {}))
+        current = dict(session)
+        for name in base:
+            if name not in current:
+                merged.pop(name, None)
+        for name, value in current.items():
+            if name not in base or base[name] != value:
+                merged[name] = value
+        session.clear()
+        session.update(merged)
+
+    async def _save_session(
+        self,
+        app: Quart,
+        session: SessionMixin,
+        response: Response | WerkzeugResponse | None,
+    ) -> None:
         if response is None:
             if session.modified:
                 app.logger.exception(
