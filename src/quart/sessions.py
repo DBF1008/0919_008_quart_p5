@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
 from datetime import datetime
 from datetime import timezone
+from typing import Any
 from typing import TYPE_CHECKING
 
 from flask.sessions import NullSession as NullSession  # noqa: F401
@@ -22,6 +24,11 @@ if TYPE_CHECKING:
     from .app import Quart  # noqa
 
 
+def _session_identity(cookie: str) -> str:
+    """Return a stable identity for the session stored in the cookie."""
+    return hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+
+
 class SessionInterface:
     """Base class for session interfaces.
 
@@ -29,10 +36,83 @@ class SessionInterface:
         null_session_class: Storage class for null (no storage)
             sessions.
         pickle_based: Indicates if pickling is used for the session.
+        max_tracked_sessions: Maximum number of session identities for
+            which version information is retained to detect and merge
+            conflicting concurrent modifications.
     """
 
     null_session_class = NullSession
     pickle_based = False
+    max_tracked_sessions = 512
+
+    def __init__(self) -> None:
+        self._session_versions: OrderedDict[str, int] = OrderedDict()
+        self._session_data: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+    def _tracked_versions(self) -> OrderedDict[str, int]:
+        # Lazily initialised so subclasses that do not call
+        # super().__init__() are still protected.
+        if not hasattr(self, "_session_versions"):
+            self._session_versions = OrderedDict()
+        return self._session_versions
+
+    def _tracked_data(self) -> OrderedDict[str, dict[str, Any]]:
+        if not hasattr(self, "_session_data"):
+            self._session_data = OrderedDict()
+        return self._session_data
+
+    def _track_session_open(self, session: SessionMixin, identity: str) -> None:
+        """Record the version the session was opened at.
+
+        This stamps the session with the identity, the current version
+        and a snapshot of the data as opened, so that a later
+        :meth:`_merge_session_changes` call can detect and resolve
+        conflicts caused by concurrent requests.
+        """
+        session._quart_identity = identity
+        session._quart_version = self._tracked_versions().get(identity, 0)
+        session._quart_snapshot = dict(session)
+
+    def _merge_session_changes(self, session: SessionMixin) -> None:
+        """Merge concurrent changes and bump the session version.
+
+        If another request sharing the same session identity saved
+        after this session was opened, the session is stale. Rather
+        than overwriting the other request's changes (lost update),
+        the changes made by this session - computed by diffing against
+        the snapshot taken when it was opened - are applied on top of
+        the most recently saved data.
+        """
+        identity = getattr(session, "_quart_identity", None)
+        if identity is None:
+            return
+
+        versions = self._tracked_versions()
+        stored_data = self._tracked_data()
+        current_version = versions.get(identity, 0)
+        opened_version = getattr(session, "_quart_version", current_version)
+
+        if opened_version < current_version:
+            latest = stored_data.get(identity, {})
+            snapshot = getattr(session, "_quart_snapshot", {})
+            merged = dict(latest)
+            for key in snapshot.keys() - session.keys():
+                merged.pop(key, None)
+            for key, value in session.items():
+                if key not in snapshot or snapshot[key] != value:
+                    merged[key] = value
+            if merged != dict(session):
+                session.clear()
+                session.update(merged)
+
+        versions[identity] = current_version + 1
+        versions.move_to_end(identity)
+        stored_data[identity] = dict(session)
+        stored_data.move_to_end(identity)
+        while len(versions) > self.max_tracked_sessions:
+            versions.popitem(last=False)
+        while len(stored_data) > self.max_tracked_sessions:
+            stored_data.popitem(last=False)
 
     async def make_null_session(self, app: Quart) -> NullSession:
         """Create a Null session object.
@@ -51,7 +131,12 @@ class SessionInterface:
         return app.config["SESSION_COOKIE_NAME"]
 
     def get_cookie_domain(self, app: Quart) -> str | None:
-        """Helper method to return the Cookie Domain for the App."""
+        """Helper method to return the Cookie Domain for the App.
+
+        Empty values (None or "") are normalised to None so that the
+        Domain attribute is omitted from the cookie, rather than set
+        to an empty string which browsers treat differently.
+        """
         rv = app.config["SESSION_COOKIE_DOMAIN"]
         return rv if rv else None
 
@@ -60,8 +145,13 @@ class SessionInterface:
         return app.config["SESSION_COOKIE_PARTITIONED"]
 
     def get_cookie_path(self, app: Quart) -> str:
-        """Helper method to return the Cookie path for the App."""
-        return app.config["SESSION_COOKIE_PATH"] or app.config["APPLICATION_ROOT"]
+        """Helper method to return the Cookie path for the App.
+
+        Empty values are normalised to "/" so that the cookie path is
+        never an empty string (which browsers treat inconsistently).
+        """
+        path = app.config["SESSION_COOKIE_PATH"] or app.config["APPLICATION_ROOT"]
+        return path or "/"
 
     def get_cookie_httponly(self, app: Quart) -> bool:
         """Helper method to return if the Cookie should be HTTPOnly for the App."""
@@ -173,6 +263,10 @@ class SecureCookieSessionInterface(SessionInterface):
 
         This will return None if a signing serializer is not available,
         usually if the config SECRET_KEY is not set.
+
+        The returned session is stamped with a version and snapshot so
+        that concurrent requests sharing the same cookie can be
+        detected and merged on save (preventing lost updates).
         """
         signer = self.get_signing_serializer(app)
         if signer is None:
@@ -184,9 +278,11 @@ class SecureCookieSessionInterface(SessionInterface):
         max_age = int(app.permanent_session_lifetime.total_seconds())
         try:
             data = signer.loads(cookie, max_age=max_age)
-            return self.session_class(data)
+            session = self.session_class(data)
         except BadSignature:
-            return self.session_class()
+            session = self.session_class()
+        self._track_session_open(session, _session_identity(cookie))
+        return session
 
     async def save_session(
         self,
@@ -202,6 +298,11 @@ class SecureCookieSessionInterface(SessionInterface):
                     "These modifications will be lost as a cookie cannot be set."
                 )
             return
+
+        # Detect and merge conflicting concurrent modifications before
+        # anything is written, so a slower request cannot overwrite
+        # changes made by a faster one sharing the same session.
+        self._merge_session_changes(session)
 
         name = self.get_cookie_name(app)
         domain = self.get_cookie_domain(app)

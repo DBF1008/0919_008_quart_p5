@@ -22,8 +22,11 @@ from quart.globals import g
 from quart.globals import request
 from quart.globals import websocket
 from quart.routing import QuartRule
+from quart.sessions import SecureCookieSession
+from quart.sessions import SecureCookieSessionInterface
 from quart.testing import make_test_headers_path_and_query_string
 from quart.testing import no_op_push
+from quart.wrappers import BaseRequestWebsocket
 from quart.wrappers import Request
 
 
@@ -200,3 +203,45 @@ async def test_copy_current_websocket_context() -> None:
 def test_copy_current_websocket_context_error() -> None:
     with pytest.raises(RuntimeError):
         copy_current_websocket_context(lambda: None)()
+
+
+async def test_shared_session_is_copied_between_contexts(
+    http_scope: HTTPScope,
+) -> None:
+    app = Quart(__name__)
+    app.secret_key = "secret"
+
+    class SharedSessionInterface(SecureCookieSessionInterface):
+        def __init__(self) -> None:
+            super().__init__()
+            self.shared = SecureCookieSession()
+
+        async def open_session(
+            self, app: Quart, request: BaseRequestWebsocket
+        ) -> SecureCookieSession:
+            return self.shared
+
+    app.session_interface = SharedSessionInterface()
+
+    def make_request() -> Request:
+        return Request(
+            "GET",
+            "http",
+            "/",
+            b"",
+            Headers([("host", "quart.com")]),
+            "",
+            "1.1",
+            http_scope,
+            send_push_promise=no_op_push,
+        )
+
+    async with RequestContext(app, make_request()) as ctx1:
+        async with RequestContext(app, make_request()) as ctx2:
+            # The second context must not share the session object with
+            # the first, otherwise concurrent tasks would race mutating
+            # the same object.
+            assert ctx1.session is not ctx2.session
+            ctx2.session["key"] = "value"
+            assert "key" not in ctx1.session
+            assert ctx2.session["key"] == "value"

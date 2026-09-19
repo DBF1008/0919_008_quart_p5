@@ -112,15 +112,49 @@ class _BaseRequestWebsocketContext:
     async def _push(self) -> None:
         if self.session is None:
             session_interface = self.app.session_interface
-            self.session = await self.app.ensure_async(session_interface.open_session)(
+            session = await self.app.ensure_async(session_interface.open_session)(
                 self.app, self.request_websocket
             )
 
-            if self.session is None:
-                self.session = await session_interface.make_null_session(self.app)
+            if session is None:
+                session = await session_interface.make_null_session(self.app)
+
+            # The session object returned by open_session may be shared
+            # with another active context (for example when a session
+            # interface caches objects). Concurrent tasks mutating the
+            # same object would race, so bind an independent copy to
+            # this context instead.
+            if getattr(session, "_quart_context", None) is not None:
+                session = self._independent_session(session)
+            session._quart_context = self
+            self.session = session
 
         if self.url_adapter is not None:
             self.match_request()
+
+    @staticmethod
+    def _independent_session(session: SessionMixin) -> SessionMixin:
+        """Return an independent copy of the given session.
+
+        The copy preserves the session data, the modified/accessed
+        flags and any session tracking metadata, whilst being a
+        distinct object safe for concurrent mutation.
+        """
+        try:
+            copied = session.__class__(dict(session))
+        except TypeError:
+            copied = session.__class__()
+            copied.update(session)
+        copied.modified = session.modified
+        copied.accessed = session.accessed
+        try:
+            attributes = vars(session)
+        except TypeError:
+            attributes = {}
+        for key, value in attributes.items():
+            if key.startswith("_quart_"):
+                setattr(copied, key, value)
+        return copied
 
 
 class RequestContext(_BaseRequestWebsocketContext):
